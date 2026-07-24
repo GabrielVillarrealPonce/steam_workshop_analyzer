@@ -1,0 +1,20 @@
+# Virtual environment
+.venv/
+venv/
+
+# Quarantine: copied samples and state (never versioned)
+quarantine/
+
+# Packaged samples (fixtures live as folders, not as .zip)
+tests/fixtures/*.zip
+
+# Design documentation (kept local, not versioned)
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
