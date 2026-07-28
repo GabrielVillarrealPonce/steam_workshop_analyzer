@@ -87,16 +87,62 @@ Default model is the cheapest current one (Haiku) to stretch free API
 credits; override with `--model` or the `ANTHROPIC_MODEL` env var if a case
 needs stronger reasoning.
 
-## Develop
+## Try it out
+
+Setup (once):
 
 ```bash
 pip install -e ".[dev]"
-pytest                              # full suite, including the MCP server
-                                     # integration test (no API key needed --
-                                     # it calls tools directly, bypassing Claude)
+```
+
+Environment variables below use bash syntax (`export`). On Windows PowerShell
+use `$env:NAME = "value"` instead, and `python -m swa.cli` if the `swa` script
+is not on your PATH.
+
+**1. Run the tests** (no API key -- the MCP integration test drives the real
+tool loop over stdio, bypassing Claude):
+
+```bash
+pytest
+```
+
+**2. Deterministic pipeline** (no API key -- Stage 0-5 without the LLM):
+
+```bash
+swa triage tests/fixtures/web_con_descarga     # Stage 0+1 on one folder, prints JSON
+swa scan --no-metadata                         # triage every installed Wallpaper Engine item
+swa scan --appid 431960 --no-metadata          # any Steam game's Workshop, by its AppID
+python demo/offline_demo.py demo/steam_stealer # full pipeline (0-5), no LLM -> BLOCK verdict
+```
+
+**3. The full AI agent** (needs `ANTHROPIC_API_KEY` -- Claude decides which
+tools to run):
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+swa analyze demo/steam_stealer                 # agent loop over a folder -> BLOCK
+swa analyze tests/fixtures/web_con_descarga    # -> ESCALATE (undeclared download)
+swa analyze-id 1081688800 --appid 431960       # locate an installed item by its Workshop ID
+```
+
+The Workshop layout (`steamapps/workshop/content/<appid>/<id>`) is identical
+for every Steam title, so `--appid` generalizes the scan/analysis to any game,
+not just Wallpaper Engine (default AppID `431960`).
+
+**4. Dynamic sandbox** (Stage 3): the default backend never executes anything
+(`executed=False` -> ESCALATE). To include dynamic evidence from a report
+captured on dedicated infrastructure, without executing here:
+
+```bash
+export SWA_SANDBOX_BACKEND=replay
+export SWA_SANDBOX_REPLAY=path/to/normalized_report.json
+```
+
+Other dev entry points:
+
+```bash
 python -m swa.mcp_server            # run the MCP server standalone, for manual testing
-swa triage path/to/dir              # Stage 0+1 only, no LLM (existing dev command)
-swa analyze path/to/dir             # full agent loop (needs ANTHROPIC_API_KEY)
+python -m swa.cli --help            # all commands and flags
 ```
 
 ## Notes for the team

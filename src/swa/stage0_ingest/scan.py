@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from swa.config import WALLPAPER_ENGINE_APPID
 from swa.stage0_ingest.quarantine import compute_content_hash
 from swa.state import State
 from swa.steam.libraryfolders import find_workshop_content
@@ -23,12 +24,19 @@ class ScannedItem:
     is_new_or_changed: bool
 
 
-def scan(content_dir: str | Path | None = None, state: State | None = None) -> list[ScannedItem]:
+def scan(
+    content_dir: str | Path | None = None,
+    state: State | None = None,
+    appid: int = WALLPAPER_ENGINE_APPID,
+) -> list[ScannedItem]:
     """Enumerate installed items and mark which are new or have changed.
 
-    If `content_dir` is None, it is auto-located via libraryfolders.vdf.
+    If `content_dir` is None, the Workshop folder is auto-located for `appid`
+    via libraryfolders.vdf. `appid` defaults to Wallpaper Engine but the layout
+    (`steamapps/workshop/content/<appid>/<id>`) is identical for every Steam
+    title, so any game's Workshop can be scanned by passing its AppID.
     """
-    root = Path(content_dir) if content_dir else find_workshop_content()
+    root = Path(content_dir) if content_dir else find_workshop_content(appid)
     owns_state = state is None
     st = state or State()
     try:

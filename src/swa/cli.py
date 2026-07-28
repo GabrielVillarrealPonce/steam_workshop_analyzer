@@ -1,11 +1,16 @@
 """Command-line interface: chains ingestion (Stage 0) and triage (Stage 1).
 
-    swa scan [--no-metadata]     enumerate, ingest new items and triage them
+    swa scan [--appid N] [--no-metadata]
+                                  enumerate, ingest and triage installed items
+                                  of a Steam title (default: Wallpaper Engine)
     swa triage <path>            triage a standalone directory (development)
     swa show <workshop_id>       last recorded verdict
-    swa analyze <path>           full agent loop: ingest, then let Claude
-                                  drive Stage 1-5 via the local MCP tools
-                                  (requires ANTHROPIC_API_KEY)
+    swa analyze <path>           full agent loop over a directory: ingest, then
+                                  let Claude drive Stage 1-5 via the MCP tools
+    swa analyze-id <id> [--appid N]
+                                  same, but locate the item by its Workshop ID
+                                  in the installed Steam library
+                                  (analyze / analyze-id require ANTHROPIC_API_KEY)
 """
 
 from __future__ import annotations
@@ -15,13 +20,14 @@ import json
 import sys
 from pathlib import Path
 
+from swa.config import WALLPAPER_ENGINE_APPID
 from swa.models import Verdict, WorkshopItem
 from swa.stage0_ingest import quarantine
 from swa.stage0_ingest.scan import scan
 from swa.stage1_triage import triage as triage_mod
 from swa.state import State
 from swa.steam import metadata as metadata_mod
-from swa.steam.libraryfolders import SteamNotFoundError
+from swa.steam.libraryfolders import SteamNotFoundError, find_workshop_content
 
 # Visual marker per verdict for the summary table.
 _MARK = {
@@ -35,13 +41,16 @@ _MARK = {
 
 def _cmd_scan(args: argparse.Namespace) -> int:
     try:
-        items = scan()
+        items = scan(appid=args.appid)
     except SteamNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     new_items = [i for i in items if i.is_new_or_changed]
-    print(f"{len(items)} items installed, {len(new_items)} new or changed.\n")
+    print(
+        f"AppID {args.appid}: {len(items)} items installed, "
+        f"{len(new_items)} new or changed.\n"
+    )
 
     with State() as st:
         for si in items:
@@ -91,6 +100,40 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_analyze_id(args: argparse.Namespace) -> int:
+    """Full agent loop over an installed item located by its Workshop ID.
+
+    Resolves `steamapps/workshop/content/<appid>/<workshop_id>` in the local
+    Steam library (across disks, via libraryfolders.vdf) and runs the same
+    agent loop as `analyze`. Works for any Steam title, not just Wallpaper
+    Engine -- pass the game's AppID with --appid.
+    """
+    import os
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("error: ANTHROPIC_API_KEY is not set.", file=sys.stderr)
+        return 2
+    try:
+        content = find_workshop_content(args.appid)
+    except SteamNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    item_dir = content / args.workshop_id
+    if not item_dir.is_dir():
+        print(
+            f"error: item {args.workshop_id} not installed under AppID "
+            f"{args.appid} (looked in {item_dir})",
+            file=sys.stderr,
+        )
+        return 2
+
+    from swa.agent import DEFAULT_MODEL, analyze_path
+
+    print(analyze_path(str(item_dir), model=args.model or DEFAULT_MODEL))
+    return 0
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     with State() as st:
         h = st.content_hash(args.workshop_id)
@@ -110,6 +153,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_scan = sub.add_parser("scan", help="scan, ingest and triage new items")
+    p_scan.add_argument(
+        "--appid",
+        type=int,
+        default=WALLPAPER_ENGINE_APPID,
+        help=f"Steam AppID of the title whose Workshop to scan (default: {WALLPAPER_ENGINE_APPID}, Wallpaper Engine)",
+    )
     p_scan.add_argument("--no-metadata", action="store_true", help="do not query the Steam Web API")
     p_scan.set_defaults(func=_cmd_scan)
 
@@ -127,6 +176,20 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze.add_argument("path", help="wallpaper directory")
     p_analyze.add_argument("--model", help="override the default (cheapest) model")
     p_analyze.set_defaults(func=_cmd_analyze)
+
+    p_analyze_id = sub.add_parser(
+        "analyze-id",
+        help="full agent loop over an installed item, located by Workshop ID (needs ANTHROPIC_API_KEY)",
+    )
+    p_analyze_id.add_argument("workshop_id", help="Steam Workshop item ID")
+    p_analyze_id.add_argument(
+        "--appid",
+        type=int,
+        default=WALLPAPER_ENGINE_APPID,
+        help=f"Steam AppID the item belongs to (default: {WALLPAPER_ENGINE_APPID}, Wallpaper Engine)",
+    )
+    p_analyze_id.add_argument("--model", help="override the default (cheapest) model")
+    p_analyze_id.set_defaults(func=_cmd_analyze_id)
 
     args = parser.parse_args(argv)
     return args.func(args)
