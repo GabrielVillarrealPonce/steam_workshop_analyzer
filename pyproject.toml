@@ -7,7 +7,7 @@ dependencies = [
     "puremagic>=1.28",
     "requests>=2.31",
     "mcp>=1.2",
-    "anthropic[mcp]>=0.40",
+    "google-genai>=1.10",
 ]
 
 [project.optional-dependencies]

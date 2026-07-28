@@ -1,8 +1,10 @@
 # steam_workshop_analyzer
 
 An AI agent that detects malicious/vulnerable Wallpaper Engine content in the
-Steam Workshop. Claude is the reasoning engine; Stages 1-5 are exposed to it
-as local MCP tools it decides how and when to use, not a fixed checklist.
+Steam Workshop. Google Gemini is the reasoning engine; Stages 1-5 are exposed
+to it as local MCP tools it decides how and when to use, not a fixed checklist.
+(MCP is model-agnostic -- the tools and pipeline are unchanged from the design;
+only the driving model is Gemini.)
 
 ## Architecture
 
@@ -15,7 +17,7 @@ swa.cli / swa.agent (orchestrator, runs locally)
         |
         |  1. Stage 0 ingest (plain code, no LLM)         -> WorkshopItem manifest
         |
-        |  2. opens a conversation with Claude's API ------> Claude (Anthropic's servers)
+        |  2. opens a conversation with Gemini's API ------> Gemini (Google's servers)
         |     (manifest + list of MCP tools)                    |
         |                                                        | decides to call a tool
         |  3. relays the tool call to the local  <---------------
@@ -25,15 +27,15 @@ swa.cli / swa.agent (orchestrator, runs locally)
         |     locally (files, hashes, etc.) and
         |     returns the result
         |
-        |  5. orchestrator sends the result back -------------> Claude
-        |     to Claude; repeat 2-5 until Claude                  |
+        |  5. orchestrator sends the result back -------------> Gemini
+        |     to Gemini; repeat 2-5 until Gemini                  |
         |     calls `finalize`                                    | reasons, may call
         |                                                          another tool, or finish
         v
    final message (Stage 5's report, returned verbatim)
 ```
 
-Claude never touches your machine directly -- the orchestrator (`swa.agent`)
+Gemini never touches your machine directly -- the orchestrator (`swa.agent`)
 is always the one asking your local MCP server to actually run a stage, then
 handing the result back. See the "Agent loop" section below for exactly which
 tool wraps which stage.
@@ -53,17 +55,18 @@ Shared data contracts (`FileEntry`, `WorkshopItem`, `Finding`, `Severity`,
 `TriageResult`, `Verdict`) live in `swa.models` -- this is the integration
 surface every stage and tool is built against.
 
-## Why Stage 4's verdict isn't just "whatever Claude says"
+## Why Stage 4's verdict isn't just "whatever Gemini says"
 
 `decide` is a plain deterministic function (`swa/stage4_decision/engine.py`),
-not something the LLM computes by itself. The agent's system prompt
-(`swa/agent.py`) instructs Claude to gather evidence via tools and then call
-`decide` with that evidence -- Claude never states approve/block in its own
-prose as the actual verdict. This matters specifically because the input here
-is adversarial content (a malicious wallpaper's own script/strings could try
-to talk the model into a favorable verdict); a fixed rule ladder over
-structured findings can't be argued with the way free text can. See the rule
-ladder's docstring in `engine.py` for the full priority order.
+not something the LLM computes by itself. Gemini only chooses *which* stages to
+run; each stage caches its real findings in the MCP server, and `decide` reads
+those cached findings directly -- the model does not hand the evidence back, so
+it cannot reshape it. Gemini never states approve/block in its own prose as the
+actual verdict. This matters specifically because the input here is adversarial
+content (a malicious wallpaper's own script/strings could try to talk the model
+into a favorable verdict); a fixed rule ladder over structured findings can't be
+argued with the way free text can. See the rule ladder's docstring in
+`engine.py` for the full priority order.
 
 ## Agent loop
 
@@ -72,20 +75,20 @@ exposure, no hosting cost) exposing `run_triage`, `run_static_analysis`,
 `run_sandbox`, `decide`, and `finalize` as tools.
 
 `swa/agent.py` is the orchestrator: it ingests an item (Stage 0), spawns the
-MCP server as a subprocess, opens a Claude conversation with the manifest and
-the tool list, and runs the loop via the Anthropic SDK's `tool_runner` until
-Claude calls `finalize`.
+MCP server as a subprocess, converts the MCP tools to Gemini tools, and runs
+the function-calling loop via the `google-genai` SDK until Gemini calls
+`finalize`.
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=...        # or GOOGLE_API_KEY
 python -m swa.agent path/to/a/wallpaper/directory
 # or, once installed:
 swa analyze path/to/a/wallpaper/directory
 ```
 
-Default model is the cheapest current one (Haiku) to stretch free API
-credits; override with `--model` or the `ANTHROPIC_MODEL` env var if a case
-needs stronger reasoning.
+Default model is a cheap current one (`gemini-3-flash`) to stretch free API
+credits; override with `--model` or the `GEMINI_MODEL` env var if a case needs
+stronger reasoning.
 
 ## Try it out
 
@@ -100,7 +103,7 @@ use `$env:NAME = "value"` instead, and `python -m swa.cli` if the `swa` script
 is not on your PATH.
 
 **1. Run the tests** (no API key -- the MCP integration test drives the real
-tool loop over stdio, bypassing Claude):
+tool loop over stdio, bypassing the LLM):
 
 ```bash
 pytest
@@ -115,11 +118,11 @@ swa scan --appid 431960 --no-metadata          # any Steam game's Workshop, by i
 python demo/offline_demo.py demo/steam_stealer # full pipeline (0-5), no LLM -> BLOCK verdict
 ```
 
-**3. The full AI agent** (needs `ANTHROPIC_API_KEY` -- Claude decides which
+**3. The full AI agent** (needs a Gemini API key -- Gemini decides which
 tools to run):
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export GEMINI_API_KEY=...                       # or GOOGLE_API_KEY
 swa analyze demo/steam_stealer                 # agent loop over a folder -> BLOCK
 swa analyze tests/fixtures/web_con_descarga    # -> ESCALATE (undeclared download)
 swa analyze-id 1081688800 --appid 431960       # locate an installed item by its Workshop ID

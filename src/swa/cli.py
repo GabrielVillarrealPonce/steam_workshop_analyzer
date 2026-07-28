@@ -6,11 +6,12 @@
     swa triage <path>            triage a standalone directory (development)
     swa show <workshop_id>       last recorded verdict
     swa analyze <path>           full agent loop over a directory: ingest, then
-                                  let Claude drive Stage 1-5 via the MCP tools
+                                  let Gemini drive Stage 1-5 via the MCP tools
     swa analyze-id <id> [--appid N]
                                   same, but locate the item by its Workshop ID
                                   in the installed Steam library
-                                  (analyze / analyze-id require ANTHROPIC_API_KEY)
+                                  (analyze / analyze-id require a Gemini API key:
+                                  GEMINI_API_KEY or GOOGLE_API_KEY)
 """
 
 from __future__ import annotations
@@ -83,21 +84,45 @@ def _cmd_triage(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_analyze(args: argparse.Namespace) -> int:
-    import os
+def _run_agent(item_dir: str, model: str | None) -> int:
+    """Run the agent loop over `item_dir`, printing its verdict. Any Gemini or
+    agent failure is reduced to a single clean error line instead of the
+    multi-page async traceback the SDK would otherwise dump -- this runs live
+    in front of an audience, so a readable error matters."""
+    from swa.agent import DEFAULT_MODEL, analyze_path
 
+    try:
+        print(analyze_path(item_dir, model=model or DEFAULT_MODEL))
+        return 0
+    except Exception as exc:  # noqa: BLE001 -- unwrap and report, don't crash
+        root: BaseException = exc
+        while isinstance(root, BaseExceptionGroup) and root.exceptions:
+            root = root.exceptions[0]
+        msg = getattr(root, "message", None) or str(root)
+        print(f"error: analysis failed: {msg}", file=sys.stderr)
+        if "API key not valid" in msg or "API_KEY_INVALID" in msg:
+            print(
+                "hint: set a valid Gemini API key in GEMINI_API_KEY (or GOOGLE_API_KEY).",
+                file=sys.stderr,
+            )
+        return 1
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
     source = Path(args.path)
     if not source.is_dir():
         print(f"error: not a directory: {source}", file=sys.stderr)
         return 2
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("error: ANTHROPIC_API_KEY is not set.", file=sys.stderr)
+    from swa.agent import api_key
+
+    if not api_key():
+        print(
+            "error: no Gemini API key set (GEMINI_API_KEY or GOOGLE_API_KEY).",
+            file=sys.stderr,
+        )
         return 2
 
-    from swa.agent import DEFAULT_MODEL, analyze_path
-
-    print(analyze_path(str(source), model=args.model or DEFAULT_MODEL))
-    return 0
+    return _run_agent(str(source), args.model)
 
 
 def _cmd_analyze_id(args: argparse.Namespace) -> int:
@@ -108,10 +133,13 @@ def _cmd_analyze_id(args: argparse.Namespace) -> int:
     agent loop as `analyze`. Works for any Steam title, not just Wallpaper
     Engine -- pass the game's AppID with --appid.
     """
-    import os
+    from swa.agent import api_key
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("error: ANTHROPIC_API_KEY is not set.", file=sys.stderr)
+    if not api_key():
+        print(
+            "error: no Gemini API key set (GEMINI_API_KEY or GOOGLE_API_KEY).",
+            file=sys.stderr,
+        )
         return 2
     try:
         content = find_workshop_content(args.appid)
@@ -128,10 +156,7 @@ def _cmd_analyze_id(args: argparse.Namespace) -> int:
         )
         return 2
 
-    from swa.agent import DEFAULT_MODEL, analyze_path
-
-    print(analyze_path(str(item_dir), model=args.model or DEFAULT_MODEL))
-    return 0
+    return _run_agent(str(item_dir), args.model)
 
 
 def _cmd_show(args: argparse.Namespace) -> int:
@@ -171,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     p_show.set_defaults(func=_cmd_show)
 
     p_analyze = sub.add_parser(
-        "analyze", help="full agent loop over a standalone directory (needs ANTHROPIC_API_KEY)"
+        "analyze", help="full agent loop over a standalone directory (needs GEMINI_API_KEY)"
     )
     p_analyze.add_argument("path", help="wallpaper directory")
     p_analyze.add_argument("--model", help="override the default (cheapest) model")
@@ -179,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_analyze_id = sub.add_parser(
         "analyze-id",
-        help="full agent loop over an installed item, located by Workshop ID (needs ANTHROPIC_API_KEY)",
+        help="full agent loop over an installed item, located by Workshop ID (needs GEMINI_API_KEY)",
     )
     p_analyze_id.add_argument("workshop_id", help="Steam Workshop item ID")
     p_analyze_id.add_argument(

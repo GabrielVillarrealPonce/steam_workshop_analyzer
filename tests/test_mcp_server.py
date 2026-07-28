@@ -42,21 +42,14 @@ async def _run(quarantine_dir: str) -> dict:
             triage_dict = json.loads(triage_res.content[0].text)
             out["triage"] = triage_dict
 
-            decide_res = await session.call_tool(
-                "decide",
-                {
-                    "quarantine_dir": quarantine_dir,
-                    "triage_result": triage_dict,
-                    "static_findings": None,
-                    "dynamic_findings": None,
-                    "dynamic_executed": False,
-                },
-            )
+            # decide/finalize read the cached evidence server-side; the agent
+            # only ever passes quarantine_dir.
+            decide_res = await session.call_tool("decide", {"quarantine_dir": quarantine_dir})
             decision_dict = json.loads(decide_res.content[0].text)
             out["decision"] = decision_dict
 
             finalize_res = await session.call_tool(
-                "finalize", {"quarantine_dir": quarantine_dir, "decision": decision_dict}
+                "finalize", {"quarantine_dir": quarantine_dir}
             )
             out["message"] = finalize_res.content[0].text
     return out

@@ -15,23 +15,60 @@ it as plain code before the LLM conversation even starts, and hands the
 resulting manifest to the model as context. This keeps the agent loop
 (and its token cost) focused on the steps that actually need judgement:
 triage, static/dynamic analysis, deciding, and responding.
+
+Design note on state: each stage caches its result server-side, keyed by
+`quarantine_dir` (see `_RUN_CACHE`). The agent therefore only ever passes a
+`quarantine_dir` (and, for static analysis, the list of files to inspect) --
+never the bulky evidence itself. Two payoffs: (1) every tool parameter is a
+string or a list of strings, which every model's function-calling schema
+handles cleanly; and (2) the decision is computed from the *actual* findings
+each stage produced, not from anything the model hands back -- so adversarial
+content inside a wallpaper cannot reshape the evidence on its way to `decide`.
+The server is a fresh subprocess per analysis, so the cache is naturally
+scoped to a single run.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+# Keep the server's own request logging ("Processing request of type ...") off
+# stderr so a live demo shows only the agent's reasoning and the final verdict.
+logging.getLogger("mcp").setLevel(logging.WARNING)
+
 from . import stage2_static, stage3_sandbox
-from .models import Finding, Severity, TriageResult, Verdict, WorkshopItem
+from .models import Finding, TriageResult, WorkshopItem
 from .stage1_triage import triage as triage_mod
+from .stage4_decision import Decision
 from .stage4_decision import decide as decide_fn
 from .stage5_response import respond as respond_fn
 from .state import State
 
 mcp = FastMCP("steam-workshop-analyzer")
+
+
+class _RunState:
+    """Evidence gathered so far for one quarantined item, held in memory."""
+
+    def __init__(self) -> None:
+        self.triage: TriageResult | None = None
+        self.static_findings: list[Finding] = []
+        self.dynamic_findings: list[Finding] = []
+        self.dynamic_executed: bool = False
+        self.decision: Decision | None = None
+
+
+# quarantine_dir -> evidence. One process per analysis run, so this stays
+# scoped to a single item's lifecycle.
+_RUN_CACHE: dict[str, _RunState] = {}
+
+
+def _run_state(quarantine_dir: str) -> _RunState:
+    return _RUN_CACHE.setdefault(quarantine_dir, _RunState())
 
 
 def _load_item(quarantine_dir: str) -> WorkshopItem:
@@ -60,18 +97,6 @@ def _load_item(quarantine_dir: str) -> WorkshopItem:
     )
 
 
-def _findings_from_dicts(raw: list[dict]) -> list[Finding]:
-    return [
-        Finding(
-            code=f["code"],
-            severity=Severity(f["severity"]),
-            message=f["message"],
-            path=f.get("path"),
-        )
-        for f in raw
-    ]
-
-
 @mcp.tool()
 def run_triage(quarantine_dir: str) -> dict:
     """Run Stage 1 triage on an already-ingested item.
@@ -80,10 +105,12 @@ def run_triage(quarantine_dir: str) -> dict:
     contains manifest.json and the extracted files under raw/). Returns the
     TriageResult: a verdict (approve/analyze_static/sandbox_required/
     escalate/block), the list of findings, and which files are worth
-    analyzing further.
+    analyzing further. The result is cached, so `decide` will read it
+    automatically -- you do not need to pass it back.
     """
     item = _load_item(quarantine_dir)
     result = triage_mod.triage(item)
+    _run_state(quarantine_dir).triage = result
     return result.to_dict()
 
 
@@ -98,10 +125,11 @@ def run_static_analysis(quarantine_dir: str, files_to_analyze: list[str]) -> dic
     paths, C2 URLs, wallets), system-library impersonation, and
     password-protected archives with an embedded password. Returns a list of
     findings; HIGH-severity ones are treated as confirmed by the decision
-    engine (`decide`) and block outright.
+    engine (`decide`) and block outright. The findings are cached for `decide`.
     """
     item = _load_item(quarantine_dir)
     findings = stage2_static.analyze(item, files_to_analyze)
+    _run_state(quarantine_dir).static_findings = findings
     return {"findings": [f.to_dict() for f in findings]}
 
 
@@ -115,52 +143,44 @@ def run_sandbox(quarantine_dir: str) -> dict:
     result. A real backend (an external CAPEv2 instance, or a replay of a
     report captured on dedicated infrastructure) is opt-in via environment
     (SWA_SANDBOX_BACKEND). Detonation never happens on this host; see
-    swa.stage3_sandbox for the integration architecture.
+    swa.stage3_sandbox for the integration architecture. The findings are
+    cached for `decide`.
     """
     item = _load_item(quarantine_dir)
     findings, executed = stage3_sandbox.detonate(item)
+    state = _run_state(quarantine_dir)
+    state.dynamic_findings = findings
+    state.dynamic_executed = executed
     return {"findings": [f.to_dict() for f in findings], "executed": executed}
 
 
 @mcp.tool()
-def decide(
-    quarantine_dir: str,
-    triage_result: dict,
-    static_findings: list[dict] | None = None,
-    dynamic_findings: list[dict] | None = None,
-    dynamic_executed: bool = False,
-) -> dict:
-    """Compute the FINAL verdict (Stage 4). Call this once you have gathered
-    whatever evidence you judged necessary -- you MUST call this before
-    `finalize`, and you must not state a verdict yourself in prose before
-    calling it. This function is deterministic and reproducible: it is the
-    actual source of truth for approve/escalate/block, not your own reasoning.
+def decide(quarantine_dir: str) -> dict:
+    """Compute the FINAL verdict (Stage 4) from the evidence gathered so far.
 
-    `triage_result` is the dict returned by `run_triage`. `static_findings`
-    and `dynamic_findings` are the `findings` lists returned by
-    `run_static_analysis` / `run_sandbox`, if you called them (omit if you
-    didn't run that stage).
+    Call this once you have run whatever stages you judged necessary -- you
+    MUST call `run_triage` before this, and you must not state a verdict
+    yourself in prose before calling it. This function is deterministic and
+    reproducible: it reads the cached triage/static/dynamic findings the tools
+    actually produced (not anything you pass in) and is the actual source of
+    truth for approve/escalate/block. The decision is cached for `finalize`.
     """
-    tr = TriageResult(
-        workshop_id=triage_result["workshop_id"],
-        verdict=Verdict(triage_result["verdict"]),
-        declared_type=triage_result.get("declared_type"),
-        observed_types=triage_result.get("observed_types", []),
-        findings=_findings_from_dicts(triage_result.get("findings", [])),
-        files_to_analyze=triage_result.get("files_to_analyze", []),
-    )
+    state = _run_state(quarantine_dir)
+    if state.triage is None:
+        return {"error": "run_triage must be called before decide."}
     decision = decide_fn(
-        tr,
-        static_findings=_findings_from_dicts(static_findings or []),
-        dynamic_findings=_findings_from_dicts(dynamic_findings or []),
-        dynamic_executed=dynamic_executed,
+        state.triage,
+        static_findings=state.static_findings,
+        dynamic_findings=state.dynamic_findings,
+        dynamic_executed=state.dynamic_executed,
     )
+    state.decision = decision
     return decision.to_dict()
 
 
 @mcp.tool()
-def finalize(quarantine_dir: str, decision: dict) -> str:
-    """Stage 5 -- MANDATORY last call. Persists the decision from `decide`
+def finalize(quarantine_dir: str) -> str:
+    """Stage 5 -- MANDATORY last call. Persists the decision `decide` computed
     and returns the exact message to show the user. You must call this tool
     to end the analysis; do not compose the final message yourself -- return
     this tool's output verbatim as your final answer, so the user-facing
@@ -168,24 +188,19 @@ def finalize(quarantine_dir: str, decision: dict) -> str:
     """
     import sys
 
-    from .stage4_decision import Decision
+    state = _run_state(quarantine_dir)
+    if state.decision is None:
+        return "error: decide must be called before finalize."
 
     item = _load_item(quarantine_dir)
-    dec = Decision(
-        workshop_id=decision["workshop_id"],
-        verdict=Verdict(decision["verdict"]),
-        score=decision["score"],
-        reasons=decision.get("reasons", []),
-        triggering_findings=_findings_from_dicts(decision.get("triggering_findings", [])),
-    )
     try:
         with State() as st:
-            return respond_fn(dec, item, state=st)
+            return respond_fn(state.decision, item, state=st)
     except Exception as exc:  # sqlite can fail on some filesystems/mounts;
         # losing the "skip unchanged items on rescan" optimization is far
         # better than losing the verdict itself.
         print(f"warning: could not persist to state DB ({exc}); continuing", file=sys.stderr)
-        return respond_fn(dec, item, state=None)
+        return respond_fn(state.decision, item, state=None)
 
 
 if __name__ == "__main__":
