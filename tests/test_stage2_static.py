@@ -235,6 +235,23 @@ def test_js_eval_flagged():
     assert "dynamic_code_execution" in c
 
 
+def test_html_relative_assets_not_flagged_as_domains():
+    # Local resource references must never be reported as undeclared domains.
+    html = (
+        '<img src="background.jpg">'
+        '<script src="app.js"></script>'
+        '<link href="./css/style.css">'
+        '<script src="https://evil.tld/x.js"></script>'
+    )
+    c = codes(scripts.analyze_script(html, "index.html", FileType.HTML, set()))
+    flagged = {
+        f.message for f in scripts.analyze_script(html, "index.html", FileType.HTML, set())
+        if f.code == "network_undeclared_domain"
+    }
+    assert any("evil.tld" in m for m in flagged)
+    assert not any("background.jpg" in m or "app.js" in m or "style.css" in m for m in flagged)
+
+
 def test_js_obfuscation_long_blob():
     src = 'var b = "%s";' % ("A" * 250)
     assert "obfuscated_code" in codes(scripts.analyze_script(src, "a.js", FileType.JAVASCRIPT, set()))

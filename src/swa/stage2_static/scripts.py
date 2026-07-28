@@ -54,6 +54,9 @@ _HEXESC_RE = re.compile(r"\\x[0-9a-fA-F]{2}")
 
 # HTML external resource references.
 _HTML_RES_RE = re.compile(r"""(?:src|href)\s*=\s*['\"]([^'\"]+)['\"]""", re.IGNORECASE)
+# Only absolute or protocol-relative URLs are network destinations; a relative
+# path (background.jpg, ./app.js, /assets/x) is a local asset, not a domain.
+_EXTERNAL_REF_RE = re.compile(r"^(?:https?:)?//", re.IGNORECASE)
 
 
 def _long_blob_re(min_len: int) -> re.Pattern[str]:
@@ -121,6 +124,8 @@ def analyze_script(
     if filetype is FileType.HTML:
         undeclared: list[str] = []
         for ref in _HTML_RES_RE.findall(text):
+            if not _EXTERNAL_REF_RE.match(ref.strip()):
+                continue  # relative/local asset, not a network destination
             host = indicators.host_of(ref)
             if host and not indicators.host_is_declared(host, allowed_domains):
                 if host not in undeclared:
